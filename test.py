@@ -232,6 +232,7 @@ class InteractiveShell:
     AFTER_PROMPT: bytes = b"\x1b]633;E\a"         # 프롬프트 출력 종료
     BEFORE_CONTINUATION: bytes = b"\x1b]633;s\a"  # 보조 프롬프트(PS2) 시작
     AFTER_CONTINUATION: bytes = b"\x1b]633;e\a"   # 보조 프롬프트 종료
+    COMMAND_START: bytes = b"\x1b]633;C\a"        # 명령어 실행 시작
     COMMAND_DONE: bytes = b"\x1b]633;D\a"         # 명령어 실행 완료
 
     ALT_SCREEN_START_1: bytes = b"\x1b[?1047h"
@@ -376,7 +377,11 @@ class InteractiveShell:
         self.session.message = ANSI(
             cleaned_prompt.decode(self.encoder, errors="ignore")
         )
-
+       
+    def _command_start(self, command: bytes) -> None:
+        """명령어 실행 시그널"""
+        self.prompt_event.clear(); self.command_start_event.set(); self.command_done_event.clear()
+       
     def _read(self, fd: int) -> bytes:
         """파일 디스크립터로부터 논블로킹 방식으로 데이터 읽기"""
         try: return os.read(fd, self.chunk_size)
@@ -450,25 +455,40 @@ class InteractiveShell:
         input_flags = attrs[0]
         local_flags = attrs[3]
         control_characters = attrs[6]
-        isig_signal = {
+        isig_signals = {
             control_characters[termios.VINTR], 
             control_characters[termios.VQUIT], 
             control_characters[termios.VSUSP]
         }
+        iexten_signals = {
+            control_characters[termios.VLNEXT],
+            control_characters[termios.VREPRINT],
+            control_characters[termios.VDISCARD],
+            control_characters[termios.VWERASE],
+        }
         raw_mode = not (local_flags & (termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN))
         cr_nl = input_flags & termios.ICRNL
+
+        contains_isig = any(char in data for char in isig_signals if char) and (local_flags & termios.ISIG)
+        contains_iexten = any(char in data for char in iexten_signals if char) and (local_flags & termios.IEXTEN)
         
         if raw_mode or not shell_fg:
             if local_flags & termios.ECHO:
                 self._echo(self.stdout_fd, data, cr_nl)
-                if data in isig_signal and (local_flags & termios.ISIG):
+                if contains_isig:
                     self.dupin_buffer.clear()
+                    self._write(self.master_fd, data)
+                elif contains_iexten:
                     self._write(self.master_fd, data)
             else:
                 self._write(self.master_fd, data)
         else:
-            if local_flags & termios.ECHO:
-                self._echo(self.stdout_fd, data, cr_nl)
+            self._echo(self.stdout_fd, data, cr_nl)
+            if contains_isig:
+                self.dupin_buffer.clear()
+                self._write(self.master_fd, data)
+            elif contains_iexten:
+                self._write(self.master_fd, data)
 
     def _display(self, fd) -> None:
         """셸의 출력을 읽어 Sequencer를 거친 후 실제 터미널(stdin_fd)에 출력"""
@@ -488,11 +508,10 @@ class InteractiveShell:
 
     async def _exec(self, data: Union[str, bytes]) -> None:
         """명령어를 셸에 전달하고, 마커와 커널 상태가 '완료'를 가리킬 때까지 대기"""
-        self.prompt_event.clear(); self.command_start_event.set(); self.command_done_event.clear()
         try:
+            termios.tcsetattr(self.slave_fd, termios.TCSANOW, self.original_attrs) # 원래 터미널 속성 복구
             self.loop.add_reader(self.dupin_fd, self._input, self.dupin_fd) # 입력 중계 시작
             await self._send(data) # 입력 전달
-            termios.tcsetattr(self.slave_fd, termios.TCSANOW, self.original_attrs) # 원래 터미널 속성 복구
             await asyncio.gather(self.prompt_event.wait(), self.command_done_event.wait()) # 입력 완료 대기
         finally:
             self.loop.remove_reader(self.dupin_fd) # 입력 중계 중단
@@ -650,6 +669,12 @@ class InteractiveShell:
         )
         self.sequencer.between_sequence(
             self.BEFORE_CONTINUATION, self.AFTER_CONTINUATION, self._set_continuation
+        )
+       self.sequencer.between_sequence(
+            self.AFTER_PROMPT, self.COMMAND_START, self._command_start
+        )
+       self.sequencer.between_sequence(
+            self.AFTER_CONTINUATION, self.COMMAND_START, self._command_start
         )
 
         self.session_app = get_app()
