@@ -363,9 +363,7 @@ class InteractiveShell:
             return False
 
     def _is_read_syscall(self, pid) -> bool:
-        if pid not in SYSCALL_PATHS:
-            SYSCALL_PATHS[pid] = f"/proc/{pid}/syscall".encode()
-        path = SYSCALL_PATHS[pid]
+        path = f"/proc/{pid}/syscall".encode()
         fd = -1
         try:
             # os.open에 바이트 경로를 직접 전달 (가장 빠름)
