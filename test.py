@@ -344,6 +344,10 @@ class InteractiveShell:
         win_size = struct.pack("HHHH", row, col, xpix, ypix)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, win_size)
 
+    def _sigwinch_handler(self, signum, frame) -> None:
+        """OS로부터 윈도우 리사이즈 신호를 받았을 때 실행되는 콜백"""
+        self._set_window_size(self.master_fd, *shutil.get_terminal_size())
+
     def _is_standby(self) -> bool:
         """커널 상태를 조회하여 셸이 명령어를 끝내고 대기 중인지 판단"""
         try:
@@ -358,9 +362,23 @@ class InteractiveShell:
         except OSError:
             return False
 
-    def _sigwinch_handler(self, signum, frame) -> None:
-        """OS로부터 윈도우 리사이즈 신호를 받았을 때 실행되는 콜백"""
-        self._set_window_size(self.master_fd, *shutil.get_terminal_size())
+    def _is_read_syscall(self, pid) -> bool:
+        if pid not in SYSCALL_PATHS:
+            SYSCALL_PATHS[pid] = f"/proc/{pid}/syscall".encode()
+        path = SYSCALL_PATHS[pid]
+        fd = -1
+        try:
+            # os.open에 바이트 경로를 직접 전달 (가장 빠름)
+            fd = os.open(path, os.O_RDONLY)
+            # 2바이트만 읽음 (예: "0 ")
+            if os.read(fd, 2) == b"0 ":
+                return True
+        except:
+            pass
+        finally:
+            if fd != -1:
+                os.close(fd)
+        return False
 
     def _set_prompt(self, prompt: bytes) -> None:
         """Sequencer가 캡처한 메인 프롬프트를 prompt-toolkit 메시지로 설정"""
@@ -378,10 +396,10 @@ class InteractiveShell:
             cleaned_prompt.decode(self.encoder, errors="ignore")
         )
        
-    def _command_start(self, command: bytes) -> None:
+    def _set_command_start(self, command: bytes) -> None:
         """명령어 실행 시그널"""
         self.prompt_event.clear(); self.command_start_event.set(); self.command_done_event.clear()
-       
+
     def _read(self, fd: int) -> bytes:
         """파일 디스크립터로부터 논블로킹 방식으로 데이터 읽기"""
         try: return os.read(fd, self.chunk_size)
@@ -448,10 +466,13 @@ class InteractiveShell:
     def _input(self, fd: int) -> None:
         """명령어 실행 중 사용자가 입력한 데이터를 PTY로 전달하고 버퍼에 보관"""
         data = self._read(fd)
-
-        shell_fg = os.tcgetpgrp(self.master_fd) == self.shell_pgid
+       
+        fg_pgid = os.tcgetpgrp(self.master_fd)
+        fg_read = self._is_read_syscall(fg_pgid)
+       
+        shell_fg = fg_pgid == self.shell_pgid
         attrs = termios.tcgetattr(self.slave_fd)
-
+        
         input_flags = attrs[0]
         local_flags = attrs[3]
         control_characters = attrs[6]
@@ -468,27 +489,38 @@ class InteractiveShell:
         }
         raw_mode = not (local_flags & (termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN))
         cr_nl = input_flags & termios.ICRNL
-
         contains_isig = any(char in data for char in isig_signals if char) and (local_flags & termios.ISIG)
         contains_iexten = any(char in data for char in iexten_signals if char) and (local_flags & termios.IEXTEN)
-        
-        if raw_mode or not shell_fg:
+
+        if contains_isig:
+            self.dupin_buffer.clear()
+            self._write(self.master_fd, data)
+            return
+
+        if raw_mode:
             if local_flags & termios.ECHO:
                 self._echo(self.stdout_fd, data, cr_nl)
-                if contains_isig:
-                    self.dupin_buffer.clear()
-                    self._write(self.master_fd, data)
-                elif contains_iexten:
+                if contains_iexten:
                     self._write(self.master_fd, data)
             else:
                 self._write(self.master_fd, data)
-        else:
-            self._echo(self.stdout_fd, data, cr_nl)
-            if contains_isig:
-                self.dupin_buffer.clear()
+            return
+
+        if not shell_fg:
+            if self._is_read_syscall(fg_pgid)):
                 self._write(self.master_fd, data)
-            elif contains_iexten:
-                self._write(self.master_fd, data)
+            else:
+                if local_flags & termios.ECHO:
+                    self._echo(self.stdout_fd, data, cr_nl)
+                    if contains_iexten:
+                        self._write(self.master_fd, data)
+                else:
+                    self._write(self.master_fd, data)
+            return
+
+        self._echo(self.stdout_fd, data, cr_nl)
+        if contains_iexten:
+            self._write(self.master_fd, data)
 
     def _display(self, fd) -> None:
         """셸의 출력을 읽어 Sequencer를 거친 후 실제 터미널(stdin_fd)에 출력"""
@@ -671,10 +703,10 @@ class InteractiveShell:
             self.BEFORE_CONTINUATION, self.AFTER_CONTINUATION, self._set_continuation
         )
        self.sequencer.between_sequence(
-            self.AFTER_PROMPT, self.COMMAND_START, self._command_start
+            self.AFTER_PROMPT, self.COMMAND_START, self._set_command_start
         )
        self.sequencer.between_sequence(
-            self.AFTER_CONTINUATION, self.COMMAND_START, self._command_start
+            self.AFTER_CONTINUATION, self.COMMAND_START, self._set_command_start
         )
 
         self.session_app = get_app()
