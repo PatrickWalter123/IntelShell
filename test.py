@@ -550,7 +550,8 @@ class InteractiveShell:
         finally:
             self.loop.remove_reader(self.dupin_fd) # 입력 중계 중단
             self.original_attrs = termios.tcgetattr(self.slave_fd)
-            mute_attrs = self.original_attrs[3] &= ~termios.ECHO
+            mute_attrs = list(self.original_attrs)
+            mute_attrs[3] &= ~termios.ECHO
             termios.tcsetattr(self.slave_fd, termios.TCSANOW, mute_attrs) # 다시 ECHO가 꺼진 속성 적용
 
     async def _spawn(self) -> None:
