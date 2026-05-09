@@ -149,12 +149,12 @@ class Sequencer:
         if data in self.between_callbacks:
             end_seq, callback, remove_seq = self.between_callbacks[data]
             self.active_between = (data, end_seq, callback, remove_seq)
+            self.between_buffer.clear()
             if not remove_seq:
                 buffer.extend(self.buffer)
-                self.buffer.clear()
-                self.between_buffer.clear()
-                self.status = 4
-                return
+            self.buffer.clear()
+            self.state = 4
+            return
 
         # 2. 단일 이벤트 시퀀스인지 확인
         if data in self.callbacks:
@@ -164,8 +164,9 @@ class Sequencer:
                 buffer.extend(self.buffer)
         else:
             buffer.extend(self.buffer)
-            self.buffer.clear()
-            self.state = 0
+
+        self.buffer.clear()
+        self.state = 0
 
     def _between(self, byte, buffer: bytearray):
         """종료 시퀀스가 나올 때까지 바이트를 between_buffer에 수집"""
@@ -181,7 +182,12 @@ class Sequencer:
                 buffer.extend(bytearray(end_seq))
 
             self.between_buffer.clear()
-            self.state = 0
+            if end_seq in self.between_callbacks:
+                new_end_seq, new_callback, new_remove_seq = self.between_callbacks[end_seq]
+                self.active_between = (end_seq, new_end_seq, new_callback, new_remove_seq)
+                self.state = 4 # 상태를 4로 유지하여 바로 다음 구간 수집 시작
+            else:
+                self.state = 0
 
     def interpret(self, data: bytes):
         """바이트 스트림을 한 바이트씩 훑으며 상태 머신 가동 (메인 엔진)"""
@@ -472,6 +478,7 @@ class InteractiveShell:
         attrs = termios.tcgetattr(self.slave_fd)
         
         input_flags = attrs[0]
+        output_flags = attrs[1]
         local_flags = attrs[3]
         control_characters = attrs[6]
         isig_signals = {
@@ -487,9 +494,7 @@ class InteractiveShell:
         }
         raw_mode = (
             not (local_flags & termios.ECHO) or 
-            not (local_flags & termios.ICANON) or 
-            not (local_flags & termios.ISIG) or 
-            not (local_flags & termios.IEXTEN)
+            not (local_flags & termios.ICANON)
         )
         cr_nl = input_flags & termios.ICRNL
         contains_isig = any(char in data for char in isig_signals if char) and (local_flags & termios.ISIG)
@@ -501,12 +506,9 @@ class InteractiveShell:
             return
 
         if raw_mode:
+            self._write(self.master_fd, data)
             if local_flags & termios.ECHO:
                 self._echo(self.stdout_fd, data, cr_nl)
-                if contains_iexten:
-                    self._write(self.master_fd, data)
-            else:
-                self._write(self.master_fd, data)
             return
 
         if not shell_fg:
@@ -550,7 +552,9 @@ class InteractiveShell:
             await asyncio.gather(self.prompt_event.wait(), self.command_done_event.wait()) # 입력 완료 대기
         finally:
             self.loop.remove_reader(self.dupin_fd) # 입력 중계 중단
-            termios.tcsetattr(self.slave_fd, termios.TCSANOW, self.mute_attrs) # 다시 ECHO가 꺼진 속성 적용
+            self.original_attrs = termios.tcgetattr(self.stdin_fd)
+            mute_attrs = self.original_attrs[3] &= ~termios.ECHO
+            termios.tcsetattr(self.slave_fd, termios.TCSANOW, mute_attrs) # 다시 ECHO가 꺼진 속성 적용
 
     async def _spawn(self) -> None:
         """자식 셸 프로세스를 생성하고 PTY 및 비동기 I/O를 설정"""
@@ -698,6 +702,7 @@ class InteractiveShell:
         self.command_done_event.clear()
 
         self.sequencer = Sequencer(encoding=self.encoder)
+        self.sequencer.on_sequence(self.COMMAND_START, lambda: None)
         self.sequencer.on_sequence(self.COMMAND_DONE, self.command_done_event.set)
         self.sequencer.between_sequence(
             self.BEFORE_PROMPT, self.AFTER_PROMPT, self._set_prompt
