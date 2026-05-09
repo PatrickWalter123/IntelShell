@@ -417,31 +417,21 @@ class InteractiveShell:
                 break
             except BlockingIOError: continue
 
-    def _echo(self, fd: int, data: bytes, cr_nl: bool) -> None:
+    def _echo(self, fd: int, data: bytes, iflags: int, oflags: int, lflags: int) -> None:
         visual_output: bytearray = bytearray()
+       
+        icrnl = iflags & termios.ICRNL
+        echo = lflags & termios.ECHO
+        echoe = lflags & termios.ECHOE
+        
+        if not echo:
+            return
+       
         i: int = 0
         while i < len(data):
             byte = data[i:i + 1]
             val = data[i]
-            if val == 0x08:
-                self.dupin_buffer.append(val)
-                visual_output.extend(b'\b \b')
-                i += 1
-
-            elif val == 0x7f:
-                self.dupin_buffer.append(val)
-                visual_output.extend(byte)
-                i += 1
-
-            elif val == 0x17:
-                self.dupin_buffer.append(val)
-                original_len = len(self.dupin_buffer)
-                new_buffer = re.sub(rb'\s*\S+\s*$', b'', self.dupin_buffer)
-                diff = original_len - len(new_buffer)
-                visual_output.extend(b'\b \b' * diff)
-                i += 1
-
-            elif val == 0x1b:
+            if val == 0x1b:
                 match = re.match(rb'\x1b\[[0-9;?]*[a-zA-Z~]', data[i:])
                 if match:
                     seq = match.group()
@@ -452,11 +442,17 @@ class InteractiveShell:
                     self.dupin_buffer.append(val)
                     visual_output.extend(b'^[')
                     i += 1
-
             else:
                 self.dupin_buffer.append(val)
-                if val == 0x0d:
-                    visual_output.extend(b'\r\n' if cr_nl else b'\n')
+                if val == 0x08:
+                    visual_output.extend(b'\b \b' if echoe else b'\b')
+                elif val == 0x0d:
+                    visual_output.extend(b'\r\n' if icrnl else b'\n')
+                elif val == 0x17:
+                    original_len = len(self.dupin_buffer)
+                    new_buffer = re.sub(rb'\s*\S+\s*$', b'', self.dupin_buffer)
+                    diff = original_len - len(new_buffer)
+                    visual_output.extend(b'\b \b' * diff)
                 else:
                     visual_output.extend(byte)
                 i += 1
@@ -496,7 +492,7 @@ class InteractiveShell:
             not (local_flags & termios.ECHO) or 
             not (local_flags & termios.ICANON)
         )
-        cr_nl = input_flags & termios.ICRNL
+        
         contains_isig = any(char in data for char in isig_signals if char) and (local_flags & termios.ISIG)
         contains_iexten = any(char in data for char in iexten_signals if char) and (local_flags & termios.IEXTEN)
 
@@ -508,7 +504,7 @@ class InteractiveShell:
         if raw_mode:
             self._write(self.master_fd, data)
             if local_flags & termios.ECHO:
-                self._echo(self.stdout_fd, data, cr_nl)
+                self._echo(self.stdout_fd, data, input_flags, output_flags, local_flags)
             return
 
         if not shell_fg:
@@ -516,14 +512,14 @@ class InteractiveShell:
                 self._write(self.master_fd, data)
             else:
                 if local_flags & termios.ECHO:
-                    self._echo(self.stdout_fd, data, cr_nl)
+                    self._echo(self.stdout_fd, data, input_flags, output_flags, local_flags)
                     if contains_iexten:
                         self._write(self.master_fd, data)
                 else:
                     self._write(self.master_fd, data)
             return
 
-        self._echo(self.stdout_fd, data, cr_nl)
+        self._echo(self.stdout_fd, data, input_flags, output_flags, local_flags)
         if contains_iexten:
             self._write(self.master_fd, data)
 
@@ -547,12 +543,13 @@ class InteractiveShell:
         """명령어를 셸에 전달하고, 마커와 커널 상태가 '완료'를 가리킬 때까지 대기"""
         try:
             termios.tcsetattr(self.slave_fd, termios.TCSANOW, self.original_attrs) # 원래 터미널 속성 복구
+            termios.tcsetattr(self.dupin_fd, termios.TCSANOW, self.original_attrs) # 원래 터미널 속성 복구
             self.loop.add_reader(self.dupin_fd, self._input, self.dupin_fd) # 입력 중계 시작
             await self._send(data) # 입력 전달
             await asyncio.gather(self.prompt_event.wait(), self.command_done_event.wait()) # 입력 완료 대기
         finally:
             self.loop.remove_reader(self.dupin_fd) # 입력 중계 중단
-            self.original_attrs = termios.tcgetattr(self.stdin_fd)
+            self.original_attrs = termios.tcgetattr(self.slave_fd)
             mute_attrs = self.original_attrs[3] &= ~termios.ECHO
             termios.tcsetattr(self.slave_fd, termios.TCSANOW, mute_attrs) # 다시 ECHO가 꺼진 속성 적용
 
