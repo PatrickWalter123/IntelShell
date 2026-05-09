@@ -487,7 +487,12 @@ class InteractiveShell:
             control_characters[termios.VDISCARD],
             control_characters[termios.VWERASE],
         }
-        raw_mode = not (local_flags & (termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN))
+        raw_mode = (
+            not (local_flags & termios.ECHO) or 
+            not (local_flags & termios.ICANON) or 
+            not (local_flags & termios.ISIG) or 
+            not (local_flags & termios.IEXTEN)
+        )
         cr_nl = input_flags & termios.ICRNL
         contains_isig = any(char in data for char in isig_signals if char) and (local_flags & termios.ISIG)
         contains_iexten = any(char in data for char in iexten_signals if char) and (local_flags & termios.IEXTEN)
